@@ -1,0 +1,198 @@
+import asyncio
+import json
+import logging
+import random
+import math
+import websockets
+from datetime import datetime
+from typing import Dict, List
+
+# Setup logging
+logger = logging.getLogger("drone_ai")
+logger.setLevel(logging.DEBUG)
+f_handler = logging.FileHandler("logs/ai_client.log")
+f_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+f_handler.setFormatter(formatter)
+logger.addHandler(f_handler)
+
+# Constants
+MAX_RANGE = 100000
+SAFE_ALTITUDES = {
+    "GREEN": 5000,
+    "YELLOW": 1000,
+    "RED": 3
+}
+MAX_TILT = 45.0
+
+
+class TelemetryParser:
+    @staticmethod
+    def parse(telemetry_str: str) -> Dict:
+        parts = telemetry_str.split('-')
+        return {
+            "x_position": int(parts[1]),
+            "y_position": int(parts[3]),
+            "battery": int(parts[5]),
+            "gyroscope": json.loads(parts[7]),
+            "wind": int(parts[9]),
+            "dust": int(parts[11]),
+            "sensor_status": parts[13]
+        }
+
+
+class DroneAI:
+    def __init__(self):
+        self.speed = 1
+        self.altitude = 50
+        self.movement = "fwd"
+        self.direction = 1
+        self.iteration = 0
+        self.max_altitude = 900
+        self.altitude_history = []
+        self.tilt_history = []
+        self.x_positions = []
+        self.y_positions = []
+        self.safe_flight = True
+        self.wind_compensation = 0
+
+    def update_history(self, telemetry: Dict):
+        self.altitude_history.append(telemetry["y_position"])
+        self.tilt_history.append(sum(abs(a) for a in telemetry["gyroscope"]))
+        self.x_positions.append(telemetry["x_position"])
+        self.y_positions.append(telemetry["y_position"])
+
+    def average_tilt(self) -> float:
+        return sum(self.tilt_history[-10:]) / max(1, len(self.tilt_history[-10:]))
+
+    def decide_next_action(self, telemetry: Dict) -> Dict:
+        self.iteration += 1
+        x = telemetry['x_position']
+        y = telemetry['y_position']
+        battery = telemetry['battery']
+        gyro = telemetry['gyroscope']
+        wind = telemetry['wind']
+        dust = telemetry['dust']
+        sensor = telemetry['sensor_status']
+        tilt = sum(abs(axis) for axis in gyro)
+
+        self.update_history(telemetry)
+
+        if tilt > MAX_TILT:
+            self.speed = max(0, self.speed - 1)
+            self.altitude -= 5
+        else:
+            if self.speed < 5:
+                self.speed += 1
+
+        max_safe = SAFE_ALTITUDES[sensor]
+        if y < max_safe:
+            self.altitude += 10
+        elif y > max_safe:
+            self.altitude -= 10
+
+        if abs(x) > MAX_RANGE * 0.95:
+            self.direction *= -1
+
+        if wind > 30:
+            self.wind_compensation = min(5, self.wind_compensation + 1)
+        else:
+            self.wind_compensation = max(0, self.wind_compensation - 1)
+
+        if battery < 20:
+            self.speed = 1
+            self.altitude = max(5, self.altitude - 10)
+
+        return {
+            "speed": self.speed,
+            "altitude": (self.altitude + self.wind_compensation) * self.direction,
+            "movement": self.movement
+        }
+
+
+class TelemetryLogger:
+    def __init__(self):
+        self.entries = []
+
+    def log(self, data: Dict):
+        timestamp = datetime.utcnow().isoformat()
+        self.entries.append((timestamp, data))
+        logger.debug(f"Logged Telemetry: {timestamp} - {data}")
+
+    def analyze_crash_patterns(self):
+        if not self.entries:
+            return None
+        last = self.entries[-1][1]
+        reasons = []
+        if last["battery"] <= 0:
+            reasons.append("Battery Depletion")
+        if last["y_position"] < 0:
+            reasons.append("Ground Collision")
+        if abs(last["x_position"]) > MAX_RANGE:
+            reasons.append("Out of Range")
+        if sum(abs(a) for a in last["gyroscope"]) > MAX_TILT:
+            reasons.append("Excessive Tilt")
+        return reasons
+
+
+async def drone_client(uri: str):
+    ai = DroneAI()
+    telemetry_log = TelemetryLogger()
+
+    try:
+        async with websockets.connect(uri) as websocket:
+            while True:
+                response = await websocket.recv()
+                data = json.loads(response)
+
+                if data["status"] == "crashed":
+                    reasons = telemetry_log.analyze_crash_patterns()
+                    logger.warning(f"Drone crashed. Reason(s): {reasons}")
+                    break
+
+                telemetry = TelemetryParser.parse(data["telemetry"])
+                telemetry_log.log(telemetry)
+
+                command = ai.decide_next_action(telemetry)
+                await websocket.send(json.dumps(command))
+                logger.info(f"Command Sent: {command}")
+
+    except Exception as e:
+        logger.error(f"Connection failed: {str(e)}")
+
+
+class Diagnostic:
+    def __init__(self, ai: DroneAI):
+        self.ai = ai
+
+    def print_summary(self):
+        logger.info("========= DIAGNOSTIC SUMMARY =========")
+        logger.info(f"Total Iterations: {self.ai.iteration}")
+        logger.info(f"Average Altitude: {self._average(self.ai.altitude_history)}")
+        logger.info(f"Average Tilt: {self.ai.average_tilt():.2f}")
+        logger.info(f"Flight Distance X: {self._distance(self.ai.x_positions)}")
+        logger.info(f"Flight Distance Y: {self._distance(self.ai.y_positions)}")
+        logger.info("=======================================")
+
+    def _average(self, arr: List[int]) -> float:
+        return sum(arr) / len(arr) if arr else 0.0
+
+    def _distance(self, pos: List[int]) -> float:
+        if len(pos) < 2:
+            return 0.0
+        return abs(pos[-1] - pos[0])
+
+
+async def main():
+    logger.info("Starting AI Drone Client with Diagnostic")
+    await drone_client("ws://localhost:8765")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Drone Simulator Client")
+    parser.add_argument('--uri', type=str, help='WebSocket URI for the drone simulator', default='ws://localhost:8765')
+    args = parser.parse_args()
+
+    asyncio.run(drone_client(args.uri))
